@@ -189,6 +189,142 @@ liquor_combo_fc |>
 
 #Based on this correlation, and on the DM test in 2.4, explain in two or three sentences why the combination did or did not beat the best individual model.
 
+#Part 4 – A Medium-Scale VAR vs. a BVAR
+  #4.1a. Download the file fredqd_2026-09.csv from Canvas and move it into the data/ folder inside your PS4 project. Then read it. Note that the first two rows after the header hold information about each series rather than data, so we remove them with slice().
+  
+  qd_raw <- read_csv("data/fredqd_2026-09.csv", show_col_types = FALSE) |>
+    slice(-(1:2))
+
+
+#4.1b.
+  growth <- function(x) 100 * difference(log(x))
+  
+  qd <- qd_raw |>
+    mutate(date = as.Date(sasdate, "%m/%d/%Y")) |>
+    transmute(date,
+              gdp    = growth(GDPC1),     # real GDP
+              cons   = growth(PCECC96),   # real consumption
+              inv    = growth(GPDIC1),    # real investment
+              emp    = growth(PAYEMS),    # payroll employment
+              infl   = growth(GDPCTPI),   # GDP price index
+              unrate = difference(UNRATE),     # unemployment rate
+              ffr    = difference(FEDFUNDS),   # federal funds rate
+              gs10   = difference(GS10)) |>    # 10-year Treasury yield
+    filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+  
+  y <- qd |> select(-date) |> as.matrix()
+  
+  nrow(y)
+  head(y) 
+
+  #4.1c. Set up the TS-CV. Our first training sample is the first 120 quarters, 1960 Q1–1989 Q4, and we then forecast one quarter ahead with an expanding window:
+  
+  N <- nrow(y)
+  origins <- 120:(N - 1)
+  actual <- y[121:N, ]
+  
+  #How many forecasts will we produce for each variable, and what are the dates of the first and last forecast?
+  
+  #4.2. OLS VARs
+  #Recall from class that an OLS VAR is just a regression for each variable on the same set of lags. The function below estimates a VAR(\(p\)) on the data in z with lm(), then uses the estimated coefficients to forecast the next period. We then use a loop to re-estimate the model at each forecast origin T and stack the forecasts into a matrix.
+  var_ols_fc <- function(z, p) {
+    e <- embed(z, p + 1)            # columns: y_t, then its lags 1 to p
+    M <- ncol(z)                    # number of variables
+    B <- coef(lm(e[, 1:M] ~ e[, -(1:M)]))
+    x <- c(1, t(z[nrow(z):(nrow(z) - p + 1), ]))   # constant, latest p lags
+    x %*% B
+  }
+  
+  fc_var1 <- NULL
+  fc_var4 <- NULL
+  for (T in origins) {
+    fc_var1 <- rbind(fc_var1, var_ols_fc(y[1:T, ], 1))
+    fc_var4 <- rbind(fc_var4, var_ols_fc(y[1:T, ], 4))
+  }
+  
+  #Compute the RMSE of each model for each variable:
+    
+    rmse_by_var <- function(f) sqrt(colMeans((actual - f)^2))
+  
+  rmse_by_var(fc_var1)
+  rmse_by_var(fc_var4)
+  
+  #Which VAR forecasts better? For how many of the eight variables? Given that the VAR(4) contains the VAR(1) as a special case, why might the smaller model forecast better?
+  
+  
+#4.3. A BVAR
+  #4.3a. Now estimate a BVAR(4) with a Minnesota prior. Since all of our series are growth rates or changes, we use a prior mean of b = 0 on each series’ own first lag. We put the code in a function so that you can easily try a different value of \(\lambda\). The min and max arguments hold \(\lambda\) at (essentially) the value we choose, rather than letting the data estimate it. To keep the run time down, we use fewer simulation draws (n_draw, n_burn) than the default. This will take about 1 to 2 minutes for each value of \(\lambda\).
+  
+  bvar_cv <- function(lambda) {
+    pr <- bv_priors(hyper = "lambda",
+                    mn = bv_mn(lambda = bv_lambda(mode = lambda, sd = 0.4,
+                                                  min = 0.999 * lambda,
+                                                  max = 1.001 * lambda),
+                               b = 0))
+    fc <- NULL
+    for (T in origins) {
+      fit_T <- bvar(y[1:T, ], lags = 4, priors = pr,
+                    n_draw = 2000, n_burn = 1000, verbose = FALSE)
+      x <- c(1, t(y[T:(T - 3), ]))         # constant and 4 lags of each variable
+      fc <- rbind(fc, x %*% coef(fit_T))   # forecast of y_{T+1}
+    }
+    fc
+  }
+  
+  set.seed(422)
+  fc_bvar_03 <- bvar_cv(0.3)
+  #saveRDS(fc_bvar_03, "results/fc_bvar_03.rds")
+  readRDS(fc_bvar_03, "results/fc_bvar_03.rds") #for write up
+  
+  
+#4.3b. Recall that a small \(\lambda\) means heavy shrinkage. Repeat 4.3a with a much tighter prior, \(\lambda = 0.05\). Then collect all of your results in a table and save it:
+    
+    set.seed(422)
+  fc_bvar_005 <- bvar_cv(0.05)
+  
+  var_results <- tibble(
+    Variable = colnames(y),
+    `VAR(1)` = rmse_by_var(fc_var1),
+    `VAR(4)` = rmse_by_var(fc_var4),
+    `BVAR(4), lambda = 0.3` = rmse_by_var(fc_bvar_03),
+    `BVAR(4), lambda = 0.05` = rmse_by_var(fc_bvar_005)
+  )
+  
+  #saveRDS(var_results, "results/var_results.rds")
+  readRDS(var_results, "results/var_results.rds") #For write up
+  
+  fc_bvar_03  <- readRDS("results/fc_bvar_03.rds")
+  var_results <- readRDS("results/var_results.rds")
+  
+  var_results |> knitr::kable(digits = 3)
+  
+  #In your write-up, your .qmd can load this table with readRDS() rather than re-running the horse race. This will save you a significant amount of computation time. Answer the following:
+    
+    #How does the BVAR(4) with \(\lambda = 0.3\) compare to the OLS VAR(4)? Both have the same variables and the same lags, so what explains any difference?
+    
+    #How does it compare to the VAR(1)?
+    
+    #What happens when \(\lambda = 0.05\)? What does this tell you about the amount of shrinkage? Suppose you used this table to choose your forecasting model. Would the winner’s RMSE here be a fair estimate of how accurately it will forecast in the future? Why or why not?
+
+  #4.3c. For GDP growth, test whether the VAR(4) and the BVAR(4) with \(\lambda = 0.3\) are equally accurate, using a Diebold–Mariano test with squared error loss. Then write the code to repeat the test for a second variable of your choice (i.e. not GDP growth). What do you conclude? How does this affect how you think about your results in 4.3b?
+  
+  e_var4 <- actual[, "gdp"] - fc_var4[, 1]
+  e_bvar <- actual[, "gdp"] - fc_bvar_03[, 1]
+  
+  forecast::dm.test(e_var4, e_bvar, h = 1, power = 2)
+  
+  # Second variable: consumption (column 2)
+  e_var4_cons <- actual[, "cons"] - fc_var4[, 2]
+  e_bvar_cons <- actual[, "cons"] - fc_bvar_03[, 2]
+  
+  forecast::dm.test(e_var4_cons, e_bvar_cons, h = 1, power = 2)
   
 
-
+  #Part 5 – A Factor Model with FRED-MD
+  
+  
+  
+  
+  
+  
+  
