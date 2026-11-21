@@ -3,12 +3,14 @@
 #install.packages("urca")
 #install.packages("tidyverse")
 #install.packages("fpp3")
+#install.packages("purrr")
 
-#library(tidyverse)
+library(tidyverse)
 library(fpp3)
 library(BVAR)
 library(urca)
 library(readr) 
+library(purrr) 
 
 #Part 2 – A Business Forecasting Horse Race: ARIMA vs. ETS
 #2.1a. Read the file and build a tsibble. We end the sample in December 2019 so that the pandemic, which caused unusual swings in this series, does not dominate the results.
@@ -274,7 +276,7 @@ liquor_combo_fc |>
   set.seed(422)
   fc_bvar_03 <- bvar_cv(0.3)
   #saveRDS(fc_bvar_03, "results/fc_bvar_03.rds")
-  readRDS(fc_bvar_03, "results/fc_bvar_03.rds") #for write up
+  #readRDS(fc_bvar_03, "results/fc_bvar_03.rds") #for write up
   
   
 #4.3b. Recall that a small \(\lambda\) means heavy shrinkage. Repeat 4.3a with a much tighter prior, \(\lambda = 0.05\). Then collect all of your results in a table and save it:
@@ -291,7 +293,7 @@ liquor_combo_fc |>
   )
   
   #saveRDS(var_results, "results/var_results.rds")
-  readRDS(var_results, "results/var_results.rds") #For write up
+  #readRDS(var_results, "results/var_results.rds") #For write up
   
   fc_bvar_03  <- readRDS("results/fc_bvar_03.rds")
   var_results <- readRDS("results/var_results.rds")
@@ -320,7 +322,116 @@ liquor_combo_fc |>
   forecast::dm.test(e_var4_cons, e_bvar_cons, h = 1, power = 2)
   
 
-  #Part 5 – A Factor Model with FRED-MD
+#Part 5 – A Factor Model with FRED-MD
+  #5.1a. Download the September 2026 vintage of FRED-MD, the file fredmd_2026-09.csv, from Canvas and move it into the data/ folder inside your PS4 project. The first row after the header gives a transformation code for each series, which says how McCracken and Ng recommend transforming it before use. For example, code 5 means the growth rate (100 times the first difference of the log). The function below applies these codes.
+  
+  md_raw <- read_csv("data/fredmd_2026-09.csv", show_col_types = FALSE)
+  tcode <- unlist(md_raw[1, -1])
+  md <- md_raw[-1, ] |> mutate(date = as.Date(sasdate, "%m/%d/%Y"))
+  
+  transform_series <- function(x, code) {
+    d <- function(v) c(NA, diff(v))
+    switch(as.character(code),
+           "1" = x,                      # level
+           "2" = d(x),                   # first difference
+           "3" = d(d(x)),                # second difference
+           "4" = log(x),                 # log
+           "5" = 100 * d(log(x)),        # growth rate
+           "6" = 100 * d(d(log(x))),     # change in the growth rate
+           "7" = d(x / dplyr::lag(x) - 1))
+  }
+  
+  
+  #5.1b. Apply the transformations, keep the same sample as in class (March 1960–December 2019), and drop any series with missing values in that sample. You should end up with 718 rows and 122 columns (the date and 121 series).
+
+  fm_dates <- as.Date(md[["sasdate"]], "%m/%d/%Y")
+  
+  fm <- bind_cols(map2(md[names(tcode)], tcode, transform_series)) |>
+    mutate(date = fm_dates, .before = 1) |>
+    filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+  
+  fm <- fm[, colSums(is.na(fm)) == 0]
+  dim(fm)   # should be 718 × 122
+
+  #5.1c. Run tcode[c("INDPRO", "PAYEMS", "CPIAUCSL", "FEDFUNDS")]. 
+  tcode[c("INDPRO", "PAYEMS", "CPIAUCSL", "FEDFUNDS")]
+  
+  #In a sentence for each: how is each of these four series transformed? Why do you think the transformation chosen for FEDFUNDS differs from the one for INDPRO?
+
+#5.2a. Estimate the factors by principal components, and find the share of the variation they explain:  
+  Z <- fm |> select(-date) |> as.matrix()
+  
+  pc <- prcomp(scale(Z))
+  
+  summary(pc)$importance[, 1:5]
+  
+  
+#5.2b. The sign of a factor is arbitrary, so we flip the first factor if needed to make it rise with industrial production. Plot it:
+  
+  F1 <- pc$x[, 1] * sign(cor(pc$x[, 1], fm$INDPRO))
+  
+  tibble(date = fm$date, F1 = F1) |>
+    ggplot(aes(date, F1)) +
+    geom_line() +
+    labs(title = "First Factor from FRED-MD", x = NULL, y = NULL) +
+    theme_minimal()
+  
+#5.2c. Find the eight series most correlated with each of the first two factors:
+    
+  sort(abs(cor(pc$x[, 1], Z))[1, ], decreasing = TRUE)[1:8]
+  sort(abs(cor(pc$x[, 2], Z))[1, ], decreasing = TRUE)[1:8]
+  
+#The names of the series can be looked up in the FRED-MD documentation, FRED-MD_updated_appendix.pdf, which is posted on Canvas. Based on these series, and on your plot, how would you describe what each factor captures?  
+
+#5.3. Replicate the Horse Race from Class  
+  
+  ip <- fm$INDPRO
+  n <- nrow(Z)
+  init <- which(fm$date == as.Date("1989-12-01"))
+  
+  e_ar <- NULL
+  e_fa <- NULL
+  for (T in init:(n - 1)) {
+    F_T <- prcomp(scale(Z[1:T, ]))$x[, 1:3]         # factors using data through T
+    d <- data.frame(y_next = ip[2:T], y = ip[1:(T - 1)], F_T[1:(T - 1), ])
+    new <- data.frame(y = ip[T], t(F_T[T, ]))
+    e_ar <- c(e_ar, ip[T + 1] - predict(lm(y_next ~ y, d), new))
+    e_fa <- c(e_fa, ip[T + 1] - predict(lm(y_next ~ ., d), new))
+  }
+  
+  c(RMSE_AR = sqrt(mean(e_ar^2)), RMSE_FA = sqrt(mean(e_fa^2)))
+  
+#In class we saw an RMSE of 0.617 for the AR(1) and 0.589 with the factors. Confirm that you get the same numbers. Why would it be cheating to estimate the factors once, using the full sample, and use those in the horse race?
+  
+  
+  #5.4 A Direct Forecast of Inflation
+  
+  direct_race <- function(series, h = 12, r = 3) {
+    lv <- md |>
+      mutate(log_x = log(.data[[series]]),
+             g = 100 * (log_x - lag(log_x))) |>
+      filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+    yh <- 100 * (lead(lv$log_x, h) - lv$log_x)      # growth over the next h months
+    g  <- lv$g                                      # growth over the latest month
+    
+    e_ar <- NULL
+    e_fa <- NULL
+    for (T in init:(n - h)) {
+      F_T <- prcomp(scale(Z[1:T, ]))$x[, 1:r, drop = FALSE]
+      i <- 1:(T - h)
+      d <- data.frame(yh = yh[i], g = g[i], F_T[i, , drop = FALSE])
+      new <- data.frame(g = g[T], F_T[T, , drop = FALSE])
+      e_ar <- c(e_ar, yh[T] - predict(lm(yh ~ g, d), new))
+      e_fa <- c(e_fa, yh[T] - predict(lm(yh ~ ., d), new))
+    }
+    tibble(series, forecasts = length(e_ar),
+           RMSE_AR = sqrt(mean(e_ar^2)), RMSE_FA = sqrt(mean(e_fa^2)),
+           MAE_AR = mean(abs(e_ar)), MAE_FA = mean(abs(e_fa)),
+           DM_pvalue = forecast::dm.test(e_ar, e_fa, h = h, power = 2,
+                                         varestimator = "bartlett")$p.value)
+  }
+  
+  direct_race("CPIAUCSL")
   
   
   
